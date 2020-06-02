@@ -1,0 +1,173 @@
+#configsvr0
+#创建配置服务复制集
+mongo --host 172.22.0.2 --port 27019
+rs.initiate(
+  {
+    _id: "rs_configsvr",
+    configsvr: true,
+    members: [
+      { _id : 0, host : "172.22.0.2:27019" },
+      { _id : 1, host : "172.22.0.3:27019" },
+      { _id : 2, host : "172.22.0.4:27019" }
+    ]
+  }
+)
+exit
+
+#shardsvr00
+#创建分片复制集
+mongo --host 172.22.0.5 --port 27018
+rs.initiate(
+  {
+    _id : "rs_shardsvr0",
+    members: [
+      { _id : 0, host : "172.22.0.5:27018" },
+      { _id : 1, host : "172.22.0.6:27018" },
+      { _id : 2, host : "172.22.0.7:27018" }
+    ]
+  }
+)
+exit
+#shardsvr10
+mongo --host 172.22.0.9 --port 27018
+rs.initiate(
+  {
+    _id : "rs_shardsvr1",
+    members: [
+      { _id : 0, host : "172.22.0.9:27018" },
+      { _id : 1, host : "172.22.0.10:27018" },
+      { _id : 2, host : "172.22.0.11:27018" }
+    ]
+  }
+)
+exit
+
+#mongos
+#增加shardsvr到集群
+mongo --host 172.22.0.8 --port 27017
+sh.addShard("rs_shardsvr0/172.22.0.5:27018,172.22.0.6:27018,172.22.0.7:27018")
+sh.addShard("rs_shardsvr1/172.22.0.9:27018,172.22.0.10:27018,172.22.0.11:27018")
+#数据库启用分片
+sh.enableSharding("ddbs")
+
+
+#对user表进行分片
+sh.addShardTag("rs_shardsvr0", "bj")
+sh.addShardTag("rs_shardsvr1", "hk")
+use ddbs
+db.createCollection('user')
+sh.shardCollection("ddbs.user", { "region": 1 ,"uid":1})
+
+sh.addTagRange("ddbs.user", { region: "Beijing" ,"uid" : MinKey},{ region: "Beijing","uid" : MaxKey }, "bj")
+sh.addTagRange("ddbs.user", { region: "Hong Kong" ,"uid" : MinKey},{ region: "Hong Kong","uid" : MaxKey }, "hk") 
+#向mongos导入user.dat
+mongoimport --host 172.22.0.8 --port 27017 -d ddbs -c user --file user.dat
+
+
+
+#对article表进行分片
+sh.addShardTag("rs_shardsvr0", "dbms1")
+sh.addShardTag("rs_shardsvr1", "dbms2")
+use ddbs
+db.createCollection('article')
+sh.addTagRange("ddbs.article", { category: "science" ,"aid" : MinKey},{ category: "science","aid" : MaxKey }, "dbms1")
+sh.addTagRange("ddbs.article", { category: "technology" ,"aid" : MinKey},{ category: "technology","aid" : MaxKey }, "dbms2") 
+sh.shardCollection("ddbs.article", { "category": 1 ,"aid":1})
+#向mongos导入article.dat
+mongoimport --host 172.22.0.8 --port 27017 -d ddbs -c article --file article.dat
+
+#向mongos导入read.dat
+mongoimport --host 172.22.0.8 --port 27017 -d ddbs -c read --file read.dat
+**通过聚合和管道生成be_read collection**
+
+```yml
+db.read.aggregate( [
+   {
+     $group: {
+        _id: "$aid",
+        timestamp: { $max: {$toLong:"$timestamp"} },
+        readNum: { $sum: {$cond: [{"$eq":["$readOrNot", "1"]}, 1, 0] } },
+        readUidList: { $push: { $cond: [{"$eq":["$readOrNot", "1"]}, "$uid", "$$REMOVE"] } },
+        commentNum: { $sum: {$cond: [{"$eq":["$commentOrNot", "1"]}, 1, 0] } },
+        commentUidList: { $push: { $cond: [{"$eq":["$commentOrNot", "1"]}, "$uid", "$$REMOVE"] } },
+        agreeNum: { $sum: {$cond: [{"$eq":["$agreeOrNot", "1"]}, 1, 0] } },
+        agreeUidList: { $push: { $cond: [{"$eq":["$agreeOrNot", "1"]}, "$uid", "$$REMOVE"] } },
+        shareNum: { $sum: {$cond: [{"$eq":["$shareOrNot", "1"]}, 1, 0] } },
+        shareUidList: { $push: { $cond: [{"$eq":["$shareOrNot", "1"]}, "$uid", "$$REMOVE"] } }
+     }
+   },
+   { $project: {_id:0, aid:"$_id", timestamp:1, readNum:1, readUidList:1, commentNum:1, commentUidList:1, agreeNum:1, agreeUidList:1, shareNum:1, shareUidList:1} },
+   { $out : "be_read" }
+] )
+```
+
+**通过聚合和管道生成popular_rank collection**
+
+```yml
+Popular_Rank = function(startDate) {
+    db.read.aggregate( [
+      { $project: { timestamp: { $toDate : {$toLong:"$timestamp"} } ,readOrNot:1, aid:1} }, 
+      { $match: { $and: [ {timestamp: { $gte: startDate }},{readOrNot: {$eq: "1"}}] } },
+      { $group: { 
+          _id: { 
+             aid: "$aid",
+             yearmonth: {$dateToString: { format: "%Y-%m", date: "$timestamp" }}
+          }, 
+          readNum: { $sum: 1}
+      } },
+      { $sort : {readNum:-1} },
+      { $group: { 
+          _id: "$_id.yearmonth",
+          articleAidList: { $push: "$_id.aid" }
+      } },
+      { $project : {_id:{$concat:[{$toString:{ $toDate: "$_id" }}, "monthly"]}, timestamp:{$toDate:"$_id"}, articleAidList:{$slice:["$articleAidList", 5]}, temporalGranularity:"monthly"}},
+      { $merge: { into: "popular_rank", whenMatched: "replace" } }
+   ] );
+   db.read.aggregate( [
+      { $project: { timestamp: { $toDate : {$toLong:"$timestamp"} } ,readOrNot:1, aid:1} }, 
+      { $match: { $and: [ {timestamp: { $gte: startDate }},{readOrNot: {$eq: "1"}}] } },
+      { $group: { 
+          _id: { 
+             aid: "$aid",
+             weeks:{ $subtract:[{$toLong:"$timestamp"} , {$mod: [ {$toLong:"$timestamp"}, 604800000 ] }]}
+          }, 
+          readNum: { $sum: 1}
+      } },
+      { $sort : {readNum:-1} },
+      { $group: { 
+          _id: "$_id.weeks",
+          articleAidList: { $push: "$_id.aid" }
+      } },
+      { $project : {_id:{$concat:[{$toString:{ $toDate: "$_id" }}, "weekly"]}, timestamp:{ $toDate: "$_id" }, articleAidList:{$slice:["$articleAidList", 5]}, temporalGranularity:"weekly"}},
+      { $merge: { into: "popular_rank", whenMatched: "replace" } }
+   ] );
+   db.read.aggregate( [
+      { $project: { timestamp: { $toDate : {$toLong:"$timestamp"} } ,readOrNot:1, aid:1} }, 
+      { $match: { $and: [ {timestamp: { $gte: startDate }},{readOrNot: {$eq: "1"}}] } },
+      { $group: { 
+          _id: { 
+             aid: "$aid",
+             days:{ $subtract:[{$toLong:"$timestamp"} , {$mod: [ {$toLong:"$timestamp"}, 86400000 ] }]}
+          }, 
+          readNum: { $sum: 1}
+      } },
+      { $sort : {readNum:-1} },
+      { $group: { 
+          _id: "$_id.days",
+          articleAidList: { $push: "$_id.aid" }
+      } },
+      { $project : {_id:{$concat:[{$toString:{ $toDate: "$_id" }}, "daily"]}, timestamp:{ $toDate: "$_id" }, articleAidList:{$slice:["$articleAidList", 5]}, temporalGranularity:"daily"}},
+      { $merge: { into: "popular_rank", whenMatched: "replace" } }
+   ],{ allowDiskUse: true } );
+};
+Popular_Rank(new ISODate("1970-01-01"))
+```
+
+**mongo-express**
+
+运行mongo-express可以作为数据查询展示
+
+```bash
+docker run -it --rm -p 8081:8081 --link mongos:mongo --net mongodb_mongo mongo-express
+```
+
